@@ -9,6 +9,7 @@
 'use strict';
 
 const fs = require('fs');
+const isWsl = require('is-wsl');
 const path = require('path');
 const webpack = require('webpack');
 const resolve = require('resolve');
@@ -27,19 +28,26 @@ const WatchMissingNodeModulesPlugin = require('react-dev-utils/WatchMissingNodeM
 const ModuleScopePlugin = require('react-dev-utils/ModuleScopePlugin');
 const getCSSModuleLocalIdent = require('react-dev-utils/getCSSModuleLocalIdent');
 const paths = require('./paths');
+const modules = require('./modules');
 const getClientEnvironment = require('./env');
 const ModuleNotFoundPlugin = require('react-dev-utils/ModuleNotFoundPlugin');
 const ForkTsCheckerWebpackPlugin = require('react-dev-utils/ForkTsCheckerWebpackPlugin');
 const typescriptFormatter = require('react-dev-utils/typescriptFormatter');
+const eslint = require('eslint');
 // @remove-on-eject-begin
 const getCacheIdentifier = require('react-dev-utils/getCacheIdentifier');
 // @remove-on-eject-end
+const postcssNormalize = require('postcss-normalize');
 
 // Source maps are resource heavy and can cause out of memory issue for large source files.
 const shouldUseSourceMap = process.env.GENERATE_SOURCEMAP !== 'false';
 // Some apps do not need the benefits of saving a web request, so not inlining the chunk
 // makes for a smoother build process.
 const shouldInlineRuntimeChunk = process.env.INLINE_RUNTIME_CHUNK !== 'false';
+
+const imageInlineSizeLimit = parseInt(
+  process.env.IMAGE_INLINE_SIZE_LIMIT || '10000'
+);
 
 // Check if TypeScript is setup
 const useTypeScript = fs.existsSync(paths.appTsConfig);
@@ -81,10 +89,7 @@ module.exports = function(webpackEnv) {
       isEnvDevelopment && require.resolve('style-loader'),
       isEnvProduction && {
         loader: MiniCssExtractPlugin.loader,
-        options: Object.assign(
-          {},
-          shouldUseRelativeAssetPaths ? { publicPath: '../../' } : undefined
-        ),
+        options: shouldUseRelativeAssetPaths ? { publicPath: '../../' } : {},
       },
       {
         loader: require.resolve('css-loader'),
@@ -107,6 +112,10 @@ module.exports = function(webpackEnv) {
               },
               stage: 3,
             }),
+            // Adds PostCSS Normalize as the reset css with default options,
+            // so that it honors browserslist config in package.json
+            // which in turn let's users customize the target behavior as per their needs.
+            postcssNormalize(),
           ],
           sourceMap: isEnvProduction && shouldUseSourceMap,
         },
@@ -163,6 +172,8 @@ module.exports = function(webpackEnv) {
       filename: isEnvProduction
         ? 'static/js/[name].[contenthash:8].js'
         : isEnvDevelopment && 'static/js/bundle.js',
+      // TODO: remove this when upgrading to webpack 5
+      futureEmitAssets: true,
       // There are also additional JS chunk files if you use code splitting.
       chunkFilename: isEnvProduction
         ? 'static/js/[name].[contenthash:8].chunk.js'
@@ -187,7 +198,7 @@ module.exports = function(webpackEnv) {
           terserOptions: {
             parse: {
               // we want terser to parse ecma 8 code. However, we don't want it
-              // to apply any minfication steps that turns valid ecma 5 code
+              // to apply any minification steps that turns valid ecma 5 code
               // into invalid ecma 5 code. This is why the 'compress' and 'output'
               // sections only apply transformations that are ecma 5 safe
               // https://github.com/facebook/create-react-app/pull/4234
@@ -203,7 +214,7 @@ module.exports = function(webpackEnv) {
               comparisons: false,
               // Disabled because of an issue with Terser breaking valid code:
               // https://github.com/facebook/create-react-app/issues/5250
-              // Pending futher investigation:
+              // Pending further investigation:
               // https://github.com/terser-js/terser/issues/120
               inline: 2,
             },
@@ -220,7 +231,9 @@ module.exports = function(webpackEnv) {
           },
           // Use multi-process parallel running to improve the build speed
           // Default number of concurrent runs: os.cpus().length - 1
-          parallel: true,
+          // Disabled on WSL (Windows Subsystem for Linux) due to an issue with Terser
+          // https://github.com/webpack-contrib/terser-webpack-plugin/issues/21
+          parallel: !isWsl,
           // Enable file caching
           cache: true,
           sourceMap: shouldUseSourceMap,
@@ -258,9 +271,8 @@ module.exports = function(webpackEnv) {
       // We placed these paths second because we want `node_modules` to "win"
       // if there are any conflicts. This matches Node resolution mechanism.
       // https://github.com/facebook/create-react-app/issues/253
-      modules: ['node_modules'].concat(
-        // It is guaranteed to exist because we tweak it in `env.js`
-        process.env.NODE_PATH.split(path.delimiter).filter(Boolean)
+      modules: ['node_modules', paths.appNodeModules].concat(
+        modules.additionalModulePaths || []
       ),
       // These are the reasonable defaults supported by the Node ecosystem.
       // We also include JSX as a common component filename extension to support
@@ -311,10 +323,32 @@ module.exports = function(webpackEnv) {
               options: {
                 formatter: require.resolve('react-dev-utils/eslintFormatter'),
                 eslintPath: require.resolve('eslint'),
+                resolvePluginsRelativeTo: __dirname,
                 // @remove-on-eject-begin
-                baseConfig: {
-                  extends: [require.resolve('eslint-config-react-app')],
-                },
+                baseConfig: (() => {
+                  const eslintCli = new eslint.CLIEngine();
+                  let eslintConfig;
+                  try {
+                    eslintConfig = eslintCli.getConfigForFile(paths.appIndexJs);
+                  } catch (e) {
+                    // A config couldn't be found.
+                  }
+
+                  // We allow overriding the config, only if it extends our config
+                  // (`extends` can be a string or array of strings).
+                  if (
+                    process.env.EXTEND_ESLINT &&
+                    eslintConfig &&
+                    eslintConfig.extends &&
+                    eslintConfig.extends.includes('react-app')
+                  ) {
+                    return eslintConfig;
+                  } else {
+                    return {
+                      extends: [require.resolve('eslint-config-react-app')],
+                    };
+                  }
+                })(),
                 ignore: false,
                 useEslintrc: false,
                 // @remove-on-eject-end
@@ -336,7 +370,7 @@ module.exports = function(webpackEnv) {
               test: [/\.bmp$/, /\.gif$/, /\.jpe?g$/, /\.png$/],
               loader: require.resolve('url-loader'),
               options: {
-                limit: 10000,
+                limit: imageInlineSizeLimit,
                 name: 'static/media/[name].[hash:8].[ext]',
               },
             },
@@ -377,7 +411,8 @@ module.exports = function(webpackEnv) {
                     {
                       loaderMap: {
                         svg: {
-                          ReactComponent: '@svgr/webpack?-svgo,+ref![path]',
+                          ReactComponent:
+                            '@svgr/webpack?-svgo,+titleProp,+ref![path]',
                         },
                       },
                     },
@@ -588,6 +623,16 @@ module.exports = function(webpackEnv) {
       new ManifestPlugin({
         fileName: 'asset-manifest.json',
         publicPath: publicPath,
+        generate: (seed, files) => {
+          const manifestFiles = files.reduce(function(manifest, file) {
+            manifest[file.name] = file.path;
+            return manifest;
+          }, seed);
+
+          return {
+            files: manifestFiles,
+          };
+        },
       }),
       // Moment.js is an extremely popular library that bundles large locale files
       // by default due to how Webpack interprets its code. This is a practical
@@ -620,6 +665,12 @@ module.exports = function(webpackEnv) {
           async: isEnvDevelopment,
           useTypescriptIncrementalApi: true,
           checkSyntacticErrors: true,
+          resolveModuleNameModule: process.versions.pnp
+            ? `${__dirname}/pnpTs.js`
+            : undefined,
+          resolveTypeReferenceDirectiveModule: process.versions.pnp
+            ? `${__dirname}/pnpTs.js`
+            : undefined,
           tsconfig: paths.appTsConfig,
           reportFiles: [
             '**',
